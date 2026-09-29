@@ -373,6 +373,8 @@ function readCache(){
   catch(e){ return []; }
 }
 function writeCache(){ try{ localStorage.setItem(CACHE_KEY, JSON.stringify(entries)); }catch(e){} }
+let cacheTimer = null;
+function scheduleCacheWrite(){ clearTimeout(cacheTimer); cacheTimer = setTimeout(writeCache, 800); }
 
 async function fetchAll(){
   const all = [], size = 1000;
@@ -392,14 +394,17 @@ async function saveEntry(fields){
     if(error) throw error;
     const i = entries.findIndex(x=>x.id === editingId);
     if(i >= 0) entries[i] = rowToEntry(data); else entries.push(rowToEntry(data));
+    scheduleCacheWrite();
+    render();                 // edits are occasional — a full (but now paginated) refresh is fine
   }else{
     const { data, error } = await sb.from('sinhala_dictionary')
       .insert({ ...fields, user_id:session.user.id, added_by:session.user.email }).select().single();
     if(error) throw error;
-    entries.push(rowToEntry(data));
+    const entry = rowToEntry(data);
+    entries.push(entry);
+    scheduleCacheWrite();
+    insertCardLive(entry);    // avoid rebuilding the WHOLE list on every single add
   }
-  writeCache();
-  render();
 }
 
 async function removeEntry(e){
@@ -408,8 +413,8 @@ async function removeEntry(e){
   const { error } = await sb.from('sinhala_dictionary').delete().eq('id', e.id);
   if(error){ toast('මකන්න නොහැකි විය: ' + niceErr(error), true); return; }
   entries = entries.filter(x=>x.id !== e.id);
-  writeCache();
-  render();
+  scheduleCacheWrite();
+  removeCardLive(e.id);
 }
 
 // adds many words at once; skips a word only if the same word AND meaning already exist; returns how many were added
@@ -469,15 +474,14 @@ function letterOf(w){
   const c = Array.from(keyOf(w))[0] || '';
   return ALPHABET.includes(c) ? c : '#';
 }
-function sorted(){
+function compareEntries(a,b){
   const idx = L => L === '#' ? 9999 : ALPHABET.indexOf(L);
-  return entries.slice().sort((a,b)=>{
-    const d = idx(letterOf(a.word)) - idx(letterOf(b.word));
-    if(d) return d;
-    const x = keyOf(a.word), y = keyOf(b.word);
-    return x < y ? -1 : (x > y ? 1 : 0);
-  });
+  const d = idx(letterOf(a.word)) - idx(letterOf(b.word));
+  if(d) return d;
+  const x = keyOf(a.word), y = keyOf(b.word);
+  return x < y ? -1 : (x > y ? 1 : 0);
 }
+function sorted(){ return entries.slice().sort(compareEntries); }
 
 /* ---------- screen rendering ---------- */
 function speak(w){
@@ -487,6 +491,7 @@ function speak(w){
 
 function card(e){
   const c = el('article','card');
+  c.dataset.id = e.id;
   const head = el('div','card-head');
   head.appendChild(el('h3','',e.word));
   c.appendChild(head);
@@ -523,37 +528,129 @@ function card(e){
   return c;
 }
 
-function render(){
-  if(sr.classList.contains('open')) fillSearch();
-  const shown = sorted();
+/* With a small dictionary, rebuilding every card on every screen update is fine.
+   Once it grows into the thousands, doing that on every single "add a word" click
+   freezes the tab (sometimes long enough that the browser offers to close it).
+   So: render() only builds the FIRST page of cards, more pages load with the
+   "තව පෙන්වන්න" button or by jumping to a letter, and adding/removing one word
+   updates just that one card instead of rebuilding the whole list. */
+const PAGE_SIZE = 150;
+let currentShown = [];   // full sorted list behind the current view, kept in sync as entries change
+let renderedCount = 0;   // how many of currentShown are actually in the DOM right now
+let lastLetter = '', lastGrid = null;
 
-  const present = new Set(shown.map(e=>letterOf(e.word)));
+function buildStrip(){
+  const present = new Set(entries.map(e=>letterOf(e.word)));
   const strip = $('strip'); strip.innerHTML = '';
   ALPHABET.concat(['#']).forEach(L=>{
     const b = el('button','lt',L);
     b.disabled = !present.has(L);
-    b.onclick = ()=>{ const t = document.getElementById('L-' + (L === '#' ? 'other' : L)); if(t) t.scrollIntoView({behavior:'smooth', block:'start'}); };
+    b.onclick = ()=>jumpToLetter(L);
     strip.appendChild(b);
   });
   strip.appendChild(el('span','status', `වචන ${entries.length}ක්`));
+}
+function updateStatusText(){
+  const st = document.querySelector('#strip .status');
+  if(st) st.textContent = `වචන ${entries.length}ක්`;
+}
+function appendNextPage(){
+  const list = $('list');
+  const end = Math.min(renderedCount + PAGE_SIZE, currentShown.length);
+  for(let i = renderedCount; i < end; i++){
+    const e = currentShown[i];
+    const L = letterOf(e.word);
+    if(L !== lastLetter){
+      lastLetter = L;
+      const sec = el('section','letter'); sec.id = 'L-' + (L === '#' ? 'other' : L);
+      sec.appendChild(el('h2','',L));
+      lastGrid = el('div','grid'); sec.appendChild(lastGrid);
+      list.appendChild(sec);
+    }
+    lastGrid.appendChild(card(e));
+  }
+  renderedCount = end;
+  updateLoadMore();
+}
+function updateLoadMore(){
+  let btn = $('loadMoreBtn');
+  const remaining = currentShown.length - renderedCount;
+  if(remaining > 0){
+    if(!btn){
+      btn = el('button','btn light','');
+      btn.id = 'loadMoreBtn'; btn.type = 'button';
+      btn.style.cssText = 'display:block;margin:22px auto;';
+      btn.onclick = appendNextPage;
+      $('list').insertAdjacentElement('afterend', btn);
+    }
+    btn.textContent = `තව පෙන්වන්න (ඉතිරි ${remaining})`;
+  }else if(btn){ btn.remove(); }
+}
+function jumpToLetter(L){
+  const targetId = 'L-' + (L === '#' ? 'other' : L);
+  let node = document.getElementById(targetId);
+  if(!node){
+    const idx = currentShown.findIndex(x => letterOf(x.word) === L);
+    if(idx === -1) return;
+    while(renderedCount <= idx && renderedCount < currentShown.length) appendNextPage();
+    node = document.getElementById(targetId);
+  }
+  if(node) node.scrollIntoView({behavior:'smooth', block:'start'});
+}
 
+function render(){
+  if(sr.classList.contains('open')) fillSearch();
+  currentShown = sorted();
+  renderedCount = 0; lastLetter = ''; lastGrid = null;
+  buildStrip();
   const list = $('list'); list.innerHTML = '';
-  if(!shown.length){
+  const oldBtn = $('loadMoreBtn'); if(oldBtn) oldBtn.remove();
+  if(!currentShown.length){
     list.appendChild(el('div','empty', '“+ අලුත් වචනයක්” ඔබා පළමු වචනය ඇතුළත් කරන්න.'));
     return;
   }
-  let cur = '', grid = null;
-  shown.forEach(e=>{
-    const L = letterOf(e.word);
-    if(L !== cur){
-      cur = L;
-      const sec = el('section','letter'); sec.id = 'L-' + (L === '#' ? 'other' : L);
-      sec.appendChild(el('h2','',L));
-      grid = el('div','grid'); sec.appendChild(grid);
-      list.appendChild(sec);
+  appendNextPage();
+}
+
+// used after adding ONE new word — updates just that word instead of rebuilding everything
+function insertCardLive(e){
+  updateStatusText();
+  const L = letterOf(e.word);
+  $('strip').querySelectorAll('.lt').forEach(b=>{ if(b.textContent === L) b.disabled = false; });
+
+  let idx = currentShown.findIndex(o => compareEntries(o, e) > 0);
+  if(idx === -1) idx = currentShown.length;
+  currentShown.splice(idx, 0, e);
+
+  if(idx < renderedCount){
+    renderedCount++;
+    const sec = document.getElementById('L-' + (L === '#' ? 'other' : L));
+    if(sec){
+      const grid = sec.querySelector('.grid');
+      const cardEl = card(e);
+      const after = Array.from(grid.children).find(c=>{
+        const h = c.querySelector('h3');
+        return h && keyOf(h.textContent).localeCompare(keyOf(e.word), 'en') > 0;
+      });
+      if(after) grid.insertBefore(cardEl, after); else grid.appendChild(cardEl);
     }
-    grid.appendChild(card(e));
-  });
+    // if its letter section isn't on screen yet, the next full render() will include it
+  }
+  updateLoadMore();
+}
+
+// used after deleting a word — removes just that card instead of rebuilding everything
+function removeCardLive(id){
+  const i = currentShown.findIndex(x => x.id === id);
+  if(i > -1){ currentShown.splice(i, 1); if(i < renderedCount) renderedCount--; }
+  const node = document.querySelector('#list .card[data-id="' + id + '"]');
+  if(node){
+    const sec = node.closest('.letter');
+    node.remove();
+    if(sec && !sec.querySelector('.card')) sec.remove();
+  }
+  updateStatusText();
+  updateLoadMore();
 }
 
 /* ---------- search popup (shows after the 2nd letter, centred on screen) ---------- */
@@ -563,7 +660,7 @@ function fillSearch(){
     const w = e.word.toLowerCase();
     return w.startsWith(term) ? 0 : (w.includes(term) ? 1 : 2);
   };
-  const hits = sorted()
+  const hits = currentShown
     .filter(e=>[e.word, e.meaning, e.note || '', ...(e.examples || [])].join('\n').toLowerCase().includes(term))
     .sort((a,b)=>score(a) - score(b));
   $('srTitle').textContent = `“${q.value.trim()}” — වචන ${hits.length}ක් හමුවිය`;
@@ -573,10 +670,11 @@ function fillSearch(){
   if(hits.length > 50) body.appendChild(el('div','empty','තවත් ප්‍රතිඵල ඇත — සෙවුම තව දිගු කරන්න.'));
 }
 function closeSearch(){ sr.classList.remove('open'); }
+let searchTimer = null;
 q.addEventListener('input', ()=>{
-  if(letterCount(q.value.trim()) < 2){ closeSearch(); return; }
-  fillSearch();
-  sr.classList.add('open');
+  if(letterCount(q.value.trim()) < 2){ closeSearch(); clearTimeout(searchTimer); return; }
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(()=>{ fillSearch(); sr.classList.add('open'); }, 150);
 });
 $('srClose').onclick = closeSearch;
 sr.addEventListener('click', ev=>{ if(ev.target === sr) closeSearch(); });
